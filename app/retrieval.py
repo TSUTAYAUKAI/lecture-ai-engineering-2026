@@ -16,7 +16,7 @@ import sqlite_vec
 
 from app.config import (
     EMBEDDING_DIMENSIONS, EMBEDDING_MAX_TOKENS, EMBEDDING_MODEL,
-    RAG_DB, RAG_DOCUMENT_IDS, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
+    NEIGHBOR_WINDOW, RAG_DB, RAG_DOCUMENT_IDS, RAG_SOURCE, RAG_TOP_K, RAG_TREE, get_api_key,
     RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS,
 )
 
@@ -138,6 +138,33 @@ def search(query: str) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def add_neighbor_pages(hits: list[dict], pages: list[dict], window: int = NEIGHBOR_WINDOW) -> list[dict]:
+    """検索結果の順番を保ち、各ページの直後に、同じ資料の前後ページを付ける。
+
+    同じページは1回だけ返す。検索で見つかったページは常に "hit" とし、
+    複数の検索結果の前後にあたるページは、最も上位の検索結果に1回だけ付ける。
+    """
+    by_position = {(page["document_id"], page["page"]): page for page in pages}
+    # 先に検索結果をすべて登録し、上位の前後ページとして先に出てしまうのを防ぐ。
+    seen = {hit["page_id"] for hit in hits}
+    results = []
+    for hit in hits:
+        results.append({**hit, "role": "hit"})
+        for offset in range(-window, window + 1):
+            # 資料IDもキーに含めるので、別の資料のページにはまたがらない。
+            page = by_position.get((hit["document_id"], hit["page"] + offset))
+            if page is None or page["page_id"] in seen:
+                continue
+            seen.add(page["page_id"])
+            results.append({**page, "role": "neighbor", "neighbor_of": hit["page_id"]})
+    return results
+
+
+def search_with_neighbors(query: str) -> list[dict]:
+    """通常の検索と同じ結果に、前後ページの本文を付けて返す。"""
+    return add_neighbor_pages(search(query), load_pages(RAG_SOURCE))
+
+
 def search_graph(query: str) -> dict:
     """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
@@ -201,9 +228,12 @@ def run_full_context(agent, question: str, model, instructions: str, prompt_temp
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="エージェントを使わず、講義資料の検索だけを実行する")
     parser.add_argument("query", help="調べたい内容")
+    parser.add_argument("--neighbors", action="store_true", help="検索したページの前後ページも表示する")
     args = parser.parse_args()
-    for i, result in enumerate(search(args.query), 1):
-        print(f"\n{'=' * 60}\n検索結果 {i}\n{'=' * 60}")
+    find = search_with_neighbors if args.neighbors else search
+    for i, result in enumerate(find(args.query), 1):
+        label = f"（{result['neighbor_of']} の前後ページ）" if result.get("role") == "neighbor" else ""
+        print(f"\n{'=' * 60}\n検索結果 {i}{label}\n{'=' * 60}")
         print(f"講義: {result['document_title']}")
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
