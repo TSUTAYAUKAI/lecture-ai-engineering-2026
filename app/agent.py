@@ -3,6 +3,7 @@
 使い方:
     uv run python -m app.agent "LoRAとQLoRAの違いは？"
     uv run python -m app.agent --trace "LoRAとQLoRAの違いは？"   # ツール呼び出しを表示
+    uv run python -m app.agent --neighbors --trace "LoRAとQLoRAの違いは？"  # 検索したページの前後も渡して回答
     uv run python -m app.agent --graph --trace "LoRAとQLoRAの違いは？"  # 検索からグラフをたどって回答
     uv run python -m app.agent --tree --trace "LoRAとQLoRAの違いは？"  # 目次をたどって回答
     uv run python -m app.agent --full-context --trace "LoRAとQLoRAの違いは？"  # 全資料を一度に渡す
@@ -21,7 +22,7 @@ from pathlib import Path
 from contextlib import nullcontext
 from time import perf_counter
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, Tool
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -83,6 +84,9 @@ agent.tool_plain(tools.search_materials)
 
 # TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
 
+# 第5回 宿題: 前後ページ付きの検索。INSTRUCTIONS をそのまま使って比べるため、ツール名は通常検索と同じにする
+NEIGHBOR_TOOL = Tool(tools.search_materials_with_neighbors, name="search_materials", takes_ctx=False)
+
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
 
@@ -136,6 +140,19 @@ def print_tools(target: Agent) -> None:
         print(f"  引数: {json.dumps(params, ensure_ascii=False)}")
 
 
+def print_search_return(part: ToolReturnPart) -> None:
+    """検索が返したページを1行ずつ表示する（通常検索と前後ページ付き検索を見比べるため）。"""
+    data = json.loads(part.content)
+    if "error" in data:
+        print(f"[tool return] {part.tool_name} -> {data['error']}")
+        return
+    chars = sum(len(page["content"]) for page in data["results"])
+    print(f"[tool return] {part.tool_name} -> {len(data['results'])}ページ・本文{chars:,}文字")
+    for page in data["results"]:
+        mark = "  + 前後" if page.get("role") == "neighbor" else "- 検索"
+        print(f"    {mark} 第{page['lecture']}回・PDF p.{page['page']} · {page['title']}")
+
+
 def print_trace(result, elapsed_seconds: float | None = None) -> None:
     """どのツールが、どの引数で呼ばれ、何を返したかを表示する。"""
     print("\n--- trace ---")
@@ -163,6 +180,8 @@ def print_trace(result, elapsed_seconds: float | None = None) -> None:
                                 print(f"      {child['content']}")
                         if not data["children"]:
                             print(f"    （末端ページ・本文{len(node.get('content', ''))}文字を取得）")
+                elif part.tool_name == "search_materials":
+                    print_search_return(part)
                 else:
                     print(f"[tool return] {part.tool_name} -> {str(part.content)[:120]}…")
     usage = result.usage
@@ -179,6 +198,7 @@ def main() -> None:
     parser.add_argument("--trace", action="store_true", help="ツール呼び出しを表示する")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--mcp", action="store_true", help="第5回: ツールを MCP サーバー（app/mcp_servers.json）から受け取る")
+    modes.add_argument("--neighbors", action="store_true", help="検索したページの前後ページも渡して答える")
     modes.add_argument("--graph", action="store_true", help="検索結果からグラフをたどり、候補ページを読んで答える")
     modes.add_argument("--tree", action="store_true", help="目次をたどり、必要なページを読んで答える")
     modes.add_argument("--full-context", action="store_true", help="検索せず、lectures.jsonの全資料を一度に渡す")
@@ -187,7 +207,9 @@ def main() -> None:
 
     target = build_mcp_agent() if args.mcp else agent
     mode = nullcontext()
-    if args.tree:
+    if args.neighbors:
+        mode = target.override(tools=[NEIGHBOR_TOOL])
+    elif args.tree:
         mode = target.override(instructions=TREE_INSTRUCTIONS, tools=[tools.browse_tree])
     elif args.graph:
         mode = target.override(instructions=GRAPH_INSTRUCTIONS, tools=[tools.search_graph])
